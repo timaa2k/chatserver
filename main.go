@@ -380,15 +380,13 @@ func (s *statistics) every(t time.Duration) {
 	var current int
 	go func() {
 		for {
-			select {
-			case <-time.Tick(t):
-				s.lock.Lock()
-				current = s.count
-				s.count = 0
-				s.lock.Unlock()
-				if current > 0 {
-					log.Println(current)
-				}
+			<-time.Tick(t)
+			s.lock.Lock()
+			current = s.count
+			s.count = 0
+			s.lock.Unlock()
+			if current > 0 {
+				log.Println(current)
 			}
 		}
 	}()
