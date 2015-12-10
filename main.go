@@ -23,7 +23,7 @@ const (
 )
 
 func main() {
-	address := flag.String("address", "localhost:8888", "Server listening address")
+	address := flag.String("address", "localhost:8888", "Listening address for TCP connections")
 	acceptor := flag.Int("acceptor", 10, "Number of TCP connection acceptors")
 	flag.Parse()
 	Listen(*address, *acceptor)
@@ -78,8 +78,9 @@ func (s *Server) handleConnections() {
 	clients := make(map[string]*client)
 	channels := make(map[string]*channel)
 	channels[public] = newChannel(public)
-	stat := statchan()
-	go channels[public].handleActivity(stat)
+	stats := newStatistics()
+	stats.every(time.Second)
+	go channels[public].handleActivity(stats)
 
 	defer func() {
 		sysmsg := fmt.Sprintf("Server shutting down!\n")
@@ -97,9 +98,8 @@ func (s *Server) handleConnections() {
 				go client.connected()
 				continue
 			}
+			go client.handleMessages()
 			clients[client.username] = client
-			go client.writeLoop()
-			go client.readLoop()
 			sysmsg := fmt.Sprintf("Connected to chatserver. Welcome %s!\n", client.username)
 			clients[client.username].write <- sysmsg
 			channels[public].join <- client
@@ -115,7 +115,7 @@ func (s *Server) handleConnections() {
 			case CREATE:
 				if _, exists := channels[msg.channel]; !exists {
 					channels[msg.channel] = newChannel(msg.channel)
-					go channels[msg.channel].handleActivity(stat)
+					go channels[msg.channel].handleActivity(stats)
 					sysmsg := fmt.Sprintf("New channel %s has been created\n", msg.channel)
 					clients[msg.sender].write <- sysmsg
 				} else {
@@ -142,7 +142,6 @@ func (s *Server) handleConnections() {
 
 type channel struct {
 	name     string
-	clients  map[string]*client
 	join     chan *client
 	leave    chan string
 	list     chan string
@@ -152,7 +151,6 @@ type channel struct {
 func newChannel(name string) *channel {
 	return &channel{
 		name:     name,
-		clients:  make(map[string]*client),
 		join:     make(chan *client),
 		leave:    make(chan string),
 		list:     make(chan string),
@@ -160,43 +158,42 @@ func newChannel(name string) *channel {
 	}
 }
 
-func (ch *channel) handleActivity(stat chan struct{}) {
+func (ch *channel) handleActivity(stats *statistics) {
+	clients := make(map[string]*client)
 	var prefix = func(t time.Time) string {
 		return t.Format("Mon Jan 2 15:04") + " | " + ch.name + " | "
 	}
 	var broadcast = func(msg string) {
-		for _, client := range ch.clients {
+		for _, client := range clients {
 			client.write <- msg
 		}
 	}
+
 	for {
 		select {
 		case msg := <-ch.messages:
 			broadcast(prefix(msg.time) + msg.sender + " > " + msg.text + "\n")
-			stat <- struct{}{}
 		case client := <-ch.join:
-			ch.clients[client.username] = client
-			client.mapmutex.Lock()
-			client.channels[ch.name] = ch
-			client.mapmutex.Unlock()
+			clients[client.username] = client
+			client.joined <- ch
 			sysmsg := fmt.Sprintf("%s has joined the channel\n", client.username)
 			broadcast(prefix(time.Now()) + sysmsg)
-			stat <- struct{}{}
+		case username := <-ch.leave:
+			client := clients[username]
+			delete(clients, username)
+			client.left <- ch.name
+			sysmsg := fmt.Sprintf("%s has left the channel\n", username)
+			broadcast(prefix(time.Now()) + sysmsg)
 		case username := <-ch.list:
-			keys := make([]string, len(ch.clients))
+			keys := make([]string, len(clients))
 			i := 0
-			for k := range ch.clients {
+			for k := range clients {
 				keys[i] = k
 				i++
 			}
-			ch.clients[username].write <- strings.Join(keys, "\n") + "\n"
-			stat <- struct{}{}
-		case username := <-ch.leave:
-			delete(ch.clients, username)
-			sysmsg := fmt.Sprintf("%s has left the channel\n", username)
-			broadcast(prefix(time.Now()) + sysmsg)
-			stat <- struct{}{}
+			clients[username].write <- strings.Join(keys, "\n") + "\n"
 		}
+		stats.messageProcessed()
 	}
 }
 
@@ -204,23 +201,20 @@ type client struct {
 	*bufio.Reader
 	net.Conn
 	server   *Server
-	channels map[string]*channel
-	mapmutex sync.RWMutex
+	joined   chan *channel
+	left     chan string
 	write    chan string
-	done     chan struct{}
 	username string
 }
 
 func newClient(s *Server, c net.Conn) *client {
-	var mutex sync.RWMutex
 	return &client{
-		Reader:   bufio.NewReader(c),
-		Conn:     c,
-		server:   s,
-		channels: make(map[string]*channel),
-		mapmutex: mutex,
-		write:    make(chan string),
-		done:     make(chan struct{}),
+		Reader: bufio.NewReader(c),
+		Conn:   c,
+		server: s,
+		joined: make(chan *channel),
+		left:   make(chan string),
+		write:  make(chan string),
 	}
 }
 
@@ -237,93 +231,113 @@ func (c *client) connected() {
 	c.server.connected <- c
 }
 
-func (c *client) readLoop() {
-	proxy := make(chan *message, 2)
-	for {
-		str, err := c.ReadString('\n')
-		if err != nil {
-			c.done <- struct{}{}
-			c.disconnect()
-			return
+func (c *client) handleMessages() {
+	channels := make(map[string]*channel)
+	read, readerror := readLoop(c)
+	writeerror := writeLoop(c)
+
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			for {
+				select {
+				case <-c.write:
+				case <-done:
+					return
+				}
+			}
+		}()
+		for _, channel := range channels {
+			channel.leave <- c.username
+			<-c.left
 		}
-		proxy <- newMessage(c.username, str)
+		done <- struct{}{}
+		close(c.write)
+		c.server.disconnected <- c.username
+	}()
+
+	for {
 		select {
-		case <-c.done:
-			return
-		case msg := <-proxy:
+		case channel := <-c.joined:
+			channels[channel.name] = channel
+		case name := <-c.left:
+			delete(channels, name)
+		case str := <-read:
+			msg := newMessage(c.username, str)
 			switch msg.command {
 			case CREATE, JOIN, ALL:
 				c.server.messages <- msg
 			case MSG:
-				c.mapmutex.RLock()
-				if _, exists := c.channels[msg.channel]; exists {
-					c.channels[msg.channel].messages <- msg
+				if _, exists := channels[msg.channel]; exists {
+					channels[msg.channel].messages <- msg
 				} else {
 					c.write <- fmt.Sprintf("Not part of channel %s\n", msg.channel)
 				}
-				c.mapmutex.RUnlock()
 			case LIST:
-				c.mapmutex.RLock()
-				if _, exists := c.channels[msg.channel]; exists {
-					c.channels[msg.channel].list <- c.username
+				if _, exists := channels[msg.channel]; exists {
+					channels[msg.channel].list <- c.username
 				} else {
 					c.write <- fmt.Sprintf("Not part of channel %s\n", msg.channel)
 				}
-				c.mapmutex.RUnlock()
 			case LEAVE:
-				c.mapmutex.RLock()
-				if _, exists := c.channels[msg.channel]; exists {
+				if _, exists := channels[msg.channel]; exists {
+					channels[msg.channel].leave <- c.username
+					delete(channels, msg.channel)
 					c.write <- fmt.Sprintf("Leaving channel %s ...\n", msg.channel)
-					c.channels[msg.channel].leave <- c.username
 				} else {
 					c.write <- fmt.Sprintf("Not part of channel %s\n", msg.channel)
 				}
-				c.mapmutex.RUnlock()
 			case MY:
-				c.mapmutex.RLock()
-				keys := make([]string, len(c.channels))
+				keys := make([]string, len(channels))
 				i := 0
-				for k := range c.channels {
+				for k := range channels {
 					keys[i] = k
 					i++
 				}
 				c.write <- strings.Join(keys, "\n") + "\n"
-				c.mapmutex.RUnlock()
 			case QUIT:
 				c.write <- fmt.Sprintf("Disconnecting %s\n", msg.sender)
-				c.disconnect()
+				return
 			default:
 				c.write <- fmt.Sprintf("Invalid command %s\n", msg.command)
 			}
+		case <-readerror:
+			return
+		case <-writeerror:
+			return
 		}
 	}
 }
 
-func (c *client) writeLoop() {
-	for msg := range c.write {
-		c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-		if _, err := c.Write([]byte(msg)); err != nil {
-			c.done <- struct{}{}
-			go func() {
-				for _ = range c.write {
-				}
-			}()
-			c.disconnect()
-			break
-		}
-	}
-}
-
-func (c *client) disconnect() {
+func readLoop(c *client) (chan string, chan struct{}) {
+	read := make(chan string)
+	readerror := make(chan struct{})
 	go func() {
-		c.mapmutex.Lock()
-		for _, channel := range c.channels {
-			channel.leave <- c.username
-			delete(c.channels, channel.name)
+		defer close(read)
+		for {
+			str, err := c.ReadString('\n')
+			if err != nil {
+				readerror <- struct{}{}
+				return
+			}
+			read <- str
 		}
-		c.mapmutex.Unlock()
-		c.server.disconnected <- c.username
 	}()
+	return read, readerror
+}
+
+func writeLoop(c *client) chan struct{} {
+	writeerror := make(chan struct{})
+	go func() {
+		for str := range c.write {
+			c.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+			if _, err := c.Write([]byte(str)); err != nil {
+				writeerror <- struct{}{}
+				return
+			}
+		}
+	}()
+	return writeerror
 }
 
 type message struct {
@@ -346,21 +360,36 @@ func newMessage(sender string, str string) *message {
 	}
 }
 
-func statchan() chan struct{} {
-	in := make(chan struct{})
-	cnt := 0
+type statistics struct {
+	count int
+	lock  sync.Mutex
+}
+
+func newStatistics() *statistics {
+	var m sync.Mutex
+	return &statistics{0, m}
+}
+
+func (s *statistics) messageProcessed() {
+	s.lock.Lock()
+	s.count++
+	s.lock.Unlock()
+}
+
+func (s *statistics) every(t time.Duration) {
+	var current int
 	go func() {
 		for {
 			select {
-			case <-time.Tick(time.Second):
-				if cnt > 0 {
-					log.Println(cnt)
-					cnt = 0
+			case <-time.Tick(t):
+				s.lock.Lock()
+				current = s.count
+				s.count = 0
+				s.lock.Unlock()
+				if current > 0 {
+					log.Println(current)
 				}
-			case <-in:
-				cnt++
 			}
 		}
 	}()
-	return in
 }
