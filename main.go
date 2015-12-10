@@ -12,14 +12,14 @@ import (
 )
 
 const (
-	ALL    = "/all"
-	CREATE = "/create"
-	JOIN   = "/join"
-	LIST   = "/list"
-	LEAVE  = "/leave"
-	MSG    = "/msg"
-	MY     = "/my"
-	QUIT   = "/quit"
+	ALL    = "/all"    // /all               lists all channels on the server
+	CREATE = "/create" // /create #mychan    creates new channel #mychan, no auto-join
+	JOIN   = "/join"   // /join #mychan      joins newly created channel
+	LIST   = "/list"   // /list #mychan      lists all connected clients for #mychan
+	LEAVE  = "/leave"  // /leave #mychan     client leaves #mychan
+	MSG    = "/msg"    // /msg #mychan text  sends text to all participants of #mychan
+	MY     = "/my"     // /my                lists all channels of client
+	QUIT   = "/quit"   // /quit              leaves all channels and disconnects client
 )
 
 func main() {
@@ -70,7 +70,8 @@ func (s *Server) handleConnections() {
 	clients := make(map[string]*client)
 	channels := make(map[string]*channel)
 	channels[public] = newChannel(public)
-	go channels[public].handleActivity()
+	stat := statchan()
+	go channels[public].handleActivity(stat)
 
 	defer func() {
 		sysmsg := fmt.Sprintf("Server shutting down!\n")
@@ -106,7 +107,7 @@ func (s *Server) handleConnections() {
 			case CREATE:
 				if _, exists := channels[msg.channel]; !exists {
 					channels[msg.channel] = newChannel(msg.channel)
-					go channels[msg.channel].handleActivity()
+					go channels[msg.channel].handleActivity(stat)
 					sysmsg := fmt.Sprintf("New channel %s has been created\n", msg.channel)
 					clients[msg.sender].write <- sysmsg
 				} else {
@@ -151,7 +152,7 @@ func newChannel(name string) *channel {
 	}
 }
 
-func (ch *channel) handleActivity() {
+func (ch *channel) handleActivity(stat chan struct{}) {
 	var prefix = func(t time.Time) string {
 		return t.Format("Mon Jan 2 15:04") + " | " + ch.name + " | "
 	}
@@ -164,6 +165,7 @@ func (ch *channel) handleActivity() {
 		select {
 		case msg := <-ch.messages:
 			broadcast(prefix(msg.time) + msg.sender + " > " + msg.text + "\n")
+			stat <- struct{}{}
 		case client := <-ch.join:
 			ch.clients[client.username] = client
 			client.mapmutex.Lock()
@@ -171,6 +173,7 @@ func (ch *channel) handleActivity() {
 			client.mapmutex.Unlock()
 			sysmsg := fmt.Sprintf("%s has joined the channel\n", client.username)
 			broadcast(prefix(time.Now()) + sysmsg)
+			stat <- struct{}{}
 		case username := <-ch.list:
 			keys := make([]string, len(ch.clients))
 			i := 0
@@ -179,10 +182,12 @@ func (ch *channel) handleActivity() {
 				i++
 			}
 			ch.clients[username].write <- strings.Join(keys, "\n") + "\n"
+			stat <- struct{}{}
 		case username := <-ch.leave:
 			delete(ch.clients, username)
 			sysmsg := fmt.Sprintf("%s has left the channel\n", username)
 			broadcast(prefix(time.Now()) + sysmsg)
+			stat <- struct{}{}
 		}
 	}
 }
@@ -288,14 +293,11 @@ func (c *client) readLoop() {
 
 func (c *client) writeLoop() {
 	for msg := range c.write {
-		c.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-		_, err := c.Write([]byte(msg))
-		if err != nil {
-			log.Printf("Error writing to %s: %v", c.username, err)
+		c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		if _, err := c.Write([]byte(msg)); err != nil {
 			c.done <- struct{}{}
 			go func() {
-				for len(c.write) > 0 {
-					<-c.write
+				for _ = range c.write {
 				}
 			}()
 			c.disconnect()
@@ -304,7 +306,7 @@ func (c *client) writeLoop() {
 	}
 }
 
-func (c *client) leaveChannels() {
+func (c *client) disconnect() {
 	go func() {
 		c.mapmutex.Lock()
 		for _, channel := range c.channels {
@@ -314,10 +316,6 @@ func (c *client) leaveChannels() {
 		c.mapmutex.Unlock()
 		c.server.disconnected <- c.username
 	}()
-}
-
-func (c *client) disconnect() {
-	c.leaveChannels()
 }
 
 type message struct {
@@ -338,4 +336,21 @@ func newMessage(sender string, str string) *message {
 	default:
 		return &message{time.Now(), sender, tokens[0], tokens[1], strings.Join(tokens[2:], " ")}
 	}
+}
+
+func statchan() chan struct{} {
+	in := make(chan struct{})
+	cnt := 0
+	go func() {
+		for {
+			select {
+			case <-time.Tick(time.Second):
+				log.Println(time.Now(), cnt)
+				cnt = 0
+			case <-in:
+				cnt++
+			}
+		}
+	}()
+	return in
 }
