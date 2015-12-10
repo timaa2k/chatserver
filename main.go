@@ -23,16 +23,17 @@ const (
 )
 
 func main() {
-	addr := flag.String("addr", "localhost:8888", "listen address")
+	address := flag.String("address", "localhost:8888", "Server listening address")
+	acceptor := flag.Int("acceptor", 10, "Number of TCP connection acceptors")
 	flag.Parse()
-	log.Fatal(Listen(*addr))
+	Listen(*address, *acceptor)
 }
 
 type Server struct {
 	connected    chan *client
 	disconnected chan string
 	messages     chan *message
-	shutdown     chan bool
+	shutdown     chan struct{}
 }
 
 func newServer() *Server {
@@ -40,28 +41,35 @@ func newServer() *Server {
 		connected:    make(chan *client),
 		disconnected: make(chan string),
 		messages:     make(chan *message),
-		shutdown:     make(chan bool),
+		shutdown:     make(chan struct{}),
 	}
 }
 
-func Listen(addr string) error {
-	ln, err := net.Listen("tcp", addr)
+func Listen(address string, acceptor int) {
+	ln, err := net.Listen("tcp", address)
 	if err != nil {
-		return err
+		return
 	}
-	log.Println("Listening on", addr)
+	log.Println("Listening on", address)
 	defer ln.Close()
 	s := newServer()
-	go s.handleConnections()
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			close(s.shutdown)
-			return err
-		}
-		log.Println("New client ", conn.RemoteAddr())
-		client := newClient(s, conn)
-		go client.connected()
+	s.accept(ln, acceptor)
+	s.handleConnections()
+}
+
+func (s *Server) accept(ln net.Listener, num int) {
+	for i := 0; i < num; i++ {
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					close(s.shutdown)
+				}
+				log.Println("New client ", conn.RemoteAddr())
+				client := newClient(s, conn)
+				go client.connected()
+			}
+		}()
 	}
 }
 
@@ -345,8 +353,10 @@ func statchan() chan struct{} {
 		for {
 			select {
 			case <-time.Tick(time.Second):
-				log.Println(time.Now(), cnt)
-				cnt = 0
+				if cnt > 0 {
+					log.Println(cnt)
+					cnt = 0
+				}
 			case <-in:
 				cnt++
 			}
