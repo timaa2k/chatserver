@@ -20,6 +20,7 @@ const (
 	MSG    = "/msg"    // /msg #mychan text  sends text to all participants of #mychan
 	MY     = "/my"     // /my                lists all channels of client
 	QUIT   = "/quit"   // /quit              leaves all channels and disconnects client
+	PUBLIC = "#public" // name of the public channel that every client joins automatically
 )
 
 func main() {
@@ -33,6 +34,7 @@ type Server struct {
 	connected    chan *client
 	disconnected chan string
 	messages     chan *message
+	joined       chan string
 	shutdown     chan struct{}
 }
 
@@ -41,6 +43,7 @@ func newServer() *Server {
 		connected:    make(chan *client),
 		disconnected: make(chan string),
 		messages:     make(chan *message),
+		joined:       make(chan string),
 		shutdown:     make(chan struct{}),
 	}
 }
@@ -74,13 +77,12 @@ func (s *Server) accept(ln net.Listener, num int) {
 }
 
 func (s *Server) handleConnections() {
-	public := "#public"
 	clients := make(map[string]*client)
 	channels := make(map[string]*channel)
-	channels[public] = newChannel(public)
+	channels[PUBLIC] = newChannel(s, PUBLIC)
 	stats := newStatistics()
 	stats.every(time.Second)
-	go channels[public].handleActivity(stats)
+	go channels[PUBLIC].handleActivity(stats)
 
 	defer func() {
 		sysmsg := fmt.Sprintf("Server shutting down!\n")
@@ -98,23 +100,22 @@ func (s *Server) handleConnections() {
 				go client.connected()
 				continue
 			}
-			go client.handleMessages()
 			clients[client.username] = client
-			sysmsg := fmt.Sprintf("Connected to chatserver. Welcome %s!\n", client.username)
-			clients[client.username].write <- sysmsg
-			channels[public].join <- client
+			go client.handleMessages()
 		case msg := <-s.messages:
 			switch msg.command {
 			case JOIN:
 				if channel, exists := channels[msg.channel]; exists {
 					channel.join <- clients[msg.sender]
+					username := <-s.joined
+					clients[username].joined <- channel
 				} else {
 					sysmsg := fmt.Sprintf("Channel %s does not exist\n", msg.channel)
 					clients[msg.sender].write <- sysmsg
 				}
 			case CREATE:
 				if _, exists := channels[msg.channel]; !exists {
-					channels[msg.channel] = newChannel(msg.channel)
+					channels[msg.channel] = newChannel(s, msg.channel)
 					go channels[msg.channel].handleActivity(stats)
 					sysmsg := fmt.Sprintf("New channel %s has been created\n", msg.channel)
 					clients[msg.sender].write <- sysmsg
@@ -141,6 +142,7 @@ func (s *Server) handleConnections() {
 }
 
 type channel struct {
+	server   *Server
 	name     string
 	join     chan *client
 	leave    chan string
@@ -148,8 +150,9 @@ type channel struct {
 	messages chan *message
 }
 
-func newChannel(name string) *channel {
+func newChannel(s *Server, name string) *channel {
 	return &channel{
+		server:   s,
 		name:     name,
 		join:     make(chan *client),
 		leave:    make(chan string),
@@ -175,7 +178,7 @@ func (ch *channel) handleActivity(stats *statistics) {
 			broadcast(prefix(msg.time) + msg.sender + " > " + msg.text + "\n")
 		case client := <-ch.join:
 			clients[client.username] = client
-			client.joined <- ch
+			ch.server.joined <- client.username
 			sysmsg := fmt.Sprintf("%s has joined the channel\n", client.username)
 			broadcast(prefix(time.Now()) + sysmsg)
 		case username := <-ch.leave:
@@ -214,7 +217,7 @@ func newClient(s *Server, c net.Conn) *client {
 		server: s,
 		joined: make(chan *channel),
 		left:   make(chan string),
-		write:  make(chan string),
+		write:  make(chan string, 20),
 	}
 }
 
@@ -233,8 +236,13 @@ func (c *client) connected() {
 
 func (c *client) handleMessages() {
 	channels := make(map[string]*channel)
+	c.server.messages <- newMessage(c.username, JOIN+" "+PUBLIC)
+	channel := <-c.joined
+	channels[channel.name] = channel
 	read, readerror := readLoop(c)
 	writeerror := writeLoop(c)
+	sysmsg := fmt.Sprintf("Connected to chatserver. Welcome %s!\n", c.username)
+	c.write <- sysmsg
 
 	defer func() {
 		done := make(chan struct{})
@@ -258,15 +266,15 @@ func (c *client) handleMessages() {
 
 	for {
 		select {
-		case channel := <-c.joined:
-			channels[channel.name] = channel
-		case name := <-c.left:
-			delete(channels, name)
 		case str := <-read:
 			msg := newMessage(c.username, str)
 			switch msg.command {
-			case CREATE, JOIN, ALL:
+			case CREATE, ALL:
 				c.server.messages <- msg
+			case JOIN:
+				c.server.messages <- msg
+				channel := <-c.joined
+				channels[channel.name] = channel
 			case MSG:
 				if _, exists := channels[msg.channel]; exists {
 					channels[msg.channel].messages <- msg
@@ -282,6 +290,7 @@ func (c *client) handleMessages() {
 			case LEAVE:
 				if _, exists := channels[msg.channel]; exists {
 					channels[msg.channel].leave <- c.username
+					<-c.left
 					delete(channels, msg.channel)
 					c.write <- fmt.Sprintf("Leaving channel %s ...\n", msg.channel)
 				} else {
@@ -310,7 +319,7 @@ func (c *client) handleMessages() {
 }
 
 func readLoop(c *client) (chan string, chan struct{}) {
-	read := make(chan string)
+	read := make(chan string, 20)
 	readerror := make(chan struct{})
 	go func() {
 		defer close(read)
